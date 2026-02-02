@@ -39,18 +39,25 @@ int main() {
     }
 
     // 2. just_error - crear un sender que falla inmediatamente
+    // Nota: just_error solo tiene set_error, así que necesitamos
+    // upon_error para convertirlo a un valor antes de sync_wait
     {
         std::println("\n--- just_error ---");
 
         auto failing_sender = ex::just_error(std::make_exception_ptr(
             std::runtime_error("intentional error")
-        ));
+        ))
+        | ex::upon_error([](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                std::println("Caught from just_error: {}", e.what());
+            }
+            return -1;  // convert error to value
+        });
 
-        try {
-            ex::sync_wait(failing_sender);
-        } catch (const std::exception& e) {
-            std::println("Caught: {}", e.what());
-        }
+        auto [result] = ex::sync_wait(failing_sender).value();
+        std::println("Result after handling: {}", result);
     }
 
     // 3. upon_error - manejar errores
@@ -121,16 +128,14 @@ int main() {
         }
     }
 
-    // 6. Patrón retry con let_error
+    // 6. Patrón retry simplificado
     {
         std::println("\n--- Retry pattern ---");
 
         int attempt = 0;
-        const int max_retries = 3;
 
-        // Función que crea un sender con retry logic
-        // Nota: en stdexec real, hay algoritmos de retry más sofisticados
-        auto with_single_retry = [&]() {
+        // Operación que falla las primeras veces
+        auto operation = [&]() {
             return ex::just()
                 | ex::then([&]() -> int {
                     ++attempt;
@@ -139,30 +144,23 @@ int main() {
                         throw std::runtime_error("transient error");
                     }
                     return 42;
-                })
-                | ex::let_error([&](std::exception_ptr) {
-                    if (attempt < max_retries) {
-                        std::println("Retrying...");
-                        return ex::just()
-                            | ex::then([&]() -> int {
-                                ++attempt;
-                                std::println("Attempt {}", attempt);
-                                if (attempt < 3) {
-                                    throw std::runtime_error("transient error");
-                                }
-                                return 42;
-                            });
-                    }
-                    // Re-throw after max retries
-                    return ex::just()
-                        | ex::then([]() -> int {
-                            throw std::runtime_error("max retries exceeded");
-                        });
                 });
         };
 
+        // Retry simple: capturar error y reintentar con let_error
+        // Nota: para retry genérico, stdexec tiene algoritmos más sofisticados
+        auto work = operation()
+            | ex::let_error([&](std::exception_ptr) {
+                std::println("Retrying...");
+                return operation()
+                    | ex::let_error([&](std::exception_ptr) {
+                        std::println("Retrying again...");
+                        return operation();  // último intento
+                    });
+            });
+
         try {
-            auto [result] = ex::sync_wait(with_single_retry()).value();
+            auto [result] = ex::sync_wait(work).value();
             std::println("Eventually succeeded: {}", result);
         } catch (const std::exception& e) {
             std::println("Gave up: {}", e.what());
